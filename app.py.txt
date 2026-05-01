@@ -1,0 +1,426 @@
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+from io import BytesIO
+import math
+from sqlalchemy import create_engine, text
+
+# Ouverture du chemin vers la base de donnée
+engine = create_engine("postgresql+psycopg2://postgres:geldy@localhost:5432/stock_db")
+
+# --- CONFIGURATION ---
+st.set_page_config(page_title="Gestion de Stock", page_icon="📉", layout="wide", initial_sidebar_state="expanded")
+
+# Thème sombre CSS personnalisé (Streamlit est déjà sombre, on ajoute juste quelques finitions)
+st.markdown("""
+    <style>
+    .stMetric {
+        background-color: #1e1e1e;
+        padding: 15px;
+        border-radius: 8px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.4);
+        border: 1px solid #333;
+    }
+    div[data-testid="stMetricValue"] {
+        color: #00b4d8;
+    }
+    .stDataFrame {
+        border-radius: 5px;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# --- FONCTIONS MÉTIER ---
+
+def save_simulation(params, results, df_main, df_synth):
+    """Fonction pour sauvegarder les données de simulation dans la base de donnée PostgreSQL"""
+    query = text("""
+        INSERT INTO simulation_stock (
+            conso_annuelle, conso_mensuelle, prix_unitaire,
+            cout_passation, taux_possession, delai_appro, stock_secu_mois,
+            N, Q, periode, point_commande,
+            df_main, df_synth
+        ) VALUES (
+            :conso_annuelle, :conso_mensuelle, :prix_unitaire,
+            :cout_passation, :taux_possession, :delai_appro, :stock_secu_mois,
+            :N, :Q, :periode, :point_commande,
+            :df_main, :df_synth
+        )
+    """)
+
+    with engine.connect() as conn:
+        conn.execute(query, {
+            **params,
+            **results,
+            "df_main": df_main.to_json(orient="records"),
+            "df_synth": df_synth.to_json(orient="split")
+        })
+        conn.commit()
+
+def load_simulations():
+    """Fonction pour charger les données de simulation depuis la base de donnée PostgreSQL"""
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT * FROM simulation_stock ORDER BY id DESC"))
+        return result.fetchall()
+
+import json
+from io import StringIO
+
+def json_to_df(df_main_json, df_synth_json):
+    """Convertir les données JSON en DataFrames"""
+    # Si les données proviennent de PostgreSQL JSONB (dict/list), on les reconvertit en string
+    if not isinstance(df_main_json, str):
+        df_main_json = json.dumps(df_main_json)
+    df_main = pd.read_json(StringIO(df_main_json), orient="records")
+        
+    if not isinstance(df_synth_json, str):
+        df_synth_json = json.dumps(df_synth_json)
+        
+    try:
+        # Nouveau format de sauvegarde
+        df_synth = pd.read_json(StringIO(df_synth_json), orient="split")
+    except ValueError:
+        # Rétrocompatibilité avec les anciennes simulations sauvegardées
+        df_synth = pd.read_json(StringIO(df_synth_json))
+    
+    return df_main, df_synth
+
+def calcul_stock(conso_annuelle, conso_mensuelle, prix_unitaire, cout_passation, taux_possession, delai_appro, stock_secu_mois):
+    """Calcule les indicateurs clés du modèle de Wilson avec protections contre les erreurs."""
+    try:
+        # Sécurisation des entrées
+        conso_annuelle = max(0.0, float(conso_annuelle or 0))
+        conso_mensuelle = max(0.0, float(conso_mensuelle or 0))
+        prix_unitaire = max(0.0, float(prix_unitaire or 0))
+        cout_passation = max(0.0, float(cout_passation or 0))
+        taux_possession = max(0.0, float(taux_possession or 0))
+        delai_appro = max(0.0, float(delai_appro or 0))
+        stock_secu_mois = max(0.0, float(stock_secu_mois or 0))
+
+        cout_possession = prix_unitaire * taux_possession
+        
+        if cout_possession <= 0:
+            Q = 0
+        else:
+            Q = math.sqrt((2 * conso_annuelle * cout_passation) / cout_possession)
+            
+        if Q > 0:
+            N = conso_annuelle / Q
+            periode_commandes = 12 / N if N > 0 else 0
+        else:
+            N = 0
+            periode_commandes = 0
+            
+        stock_secu_qte = stock_secu_mois * conso_mensuelle
+        point_commande = stock_secu_qte + (delai_appro * conso_mensuelle)
+        
+        return round(N, 2), round(Q), round(periode_commandes, 2), round(point_commande)
+    except Exception:
+        return 0, 0, 0, 0
+
+
+
+def generate_table_dynamique(Q, point_commande, delai_appro, stock_initial, df_conso):
+    """Génère le tableau principal dynamique basé sur les paramètres et la consommation éditée."""
+    df_dyn_main = []
+    df_dyn_synth = {"Commande": [], "Livraison": [], "Consommation": [], "Stock": [], "Mois": []}
+    
+    stock_courant = stock_initial
+    commandes_en_attente = [] # Liste de dicts: {"qte": ..., "mois_livraison": ...}
+    
+    for i, row in df_conso.iterrows():
+        m = row["Période"]
+        
+        # 1. Consommation
+        conso_du_mois = row["Consommation"]
+        if pd.isna(conso_du_mois):
+            conso_du_mois = 0
+            
+        # 2. Livraison
+        livraison_recue = 0
+        commandes_restantes = []
+        for cmd in commandes_en_attente:
+            if i >= cmd["mois_livraison"]:
+                livraison_recue += cmd["qte"]
+            else:
+                commandes_restantes.append(cmd)
+        commandes_en_attente = commandes_restantes
+        
+        # 3. Mise à jour stock
+        stock_avec_rupture = stock_courant - conso_du_mois
+        stock_rectifie = stock_avec_rupture + livraison_recue
+        stock_courant = stock_rectifie
+        
+        # 4. Calcul stock virtuel
+        stock_virtuel = stock_courant + sum(c["qte"] for c in commandes_en_attente)
+        
+        # 5. Décision de commande
+        commande_qte = 0
+        commande_date = "-"
+        
+        if stock_virtuel <= point_commande and not commandes_en_attente and i != len(df_conso) - 1:
+            commande_qte = Q
+            commande_date = f"Début {m[:3]}"
+            mois_livraison = i + math.ceil(delai_appro) if delai_appro > 0 else i + 1
+            commandes_en_attente.append({"qte": Q, "mois_livraison": mois_livraison})
+        
+        # 6. Formatage (0 explicite, plus de "-")
+        def fmt(val): return str(int(val))
+            
+        df_dyn_main.append([
+            m, 
+            fmt(conso_du_mois), 
+            fmt(stock_avec_rupture),
+            fmt(livraison_recue),
+            fmt(stock_rectifie),
+            commande_date,
+            fmt(commande_qte) if commande_qte > 0 else "-"
+        ])
+        
+        df_dyn_synth["Mois"].append(m)
+        df_dyn_synth["Commande"].append(fmt(commande_qte) if commande_qte > 0 else "-")
+        df_dyn_synth["Livraison"].append(fmt(livraison_recue))
+        df_dyn_synth["Consommation"].append(fmt(conso_du_mois))
+        df_dyn_synth["Stock"].append(fmt(stock_rectifie))
+
+    cols = [
+        "Période", "Consommation", "Stock avec rupture éventuelle", 
+        "Livraison", "Stock rectifié en fonction des entrées", 
+        "Commande (Date)", "Commande (Quantité)"
+    ]
+    df_main = pd.DataFrame(df_dyn_main, columns=cols)
+    
+    cols_synth = []
+    vus = {}
+    for mois in df_dyn_synth["Mois"]:
+        if mois in vus:
+            vus[mois] += 1
+            cols_synth.append(mois + " " * vus[mois])
+        else:
+            vus[mois] = 0
+            cols_synth.append(mois)
+            
+    df_synth = pd.DataFrame([df_dyn_synth["Commande"], df_dyn_synth["Livraison"], df_dyn_synth["Consommation"], df_dyn_synth["Stock"]], columns=cols_synth)
+    df_synth.index = ["Commande", "Livraison", "Consommation", "Stock"]
+    
+    return df_main, df_synth
+
+def generate_graph(df_synthese, stock_secu_qte):
+    """Génère le graphique interactif avec Plotly."""
+    stocks_bruts = df_synthese.loc["Stock"].replace("-", "0").astype(float)
+    livraisons_brutes = df_synthese.loc["Livraison"].replace("-", "0").astype(float)
+    
+    livraisons_y = [stocks_bruts.iloc[i] if livraisons_brutes.iloc[i] > 0 else None for i in range(len(stocks_bruts))]
+    
+    fig = go.Figure()
+    
+    # Courbe d'évolution du stock
+    fig.add_trace(go.Scatter(
+        x=df_synthese.columns, 
+        y=stocks_bruts,
+        mode='lines+markers',
+        name='Stock',
+        line=dict(color='#00b4d8', width=3, shape='linear'),
+        marker=dict(size=8, color='#00b4d8')
+    ))
+    
+    # Points de livraison (Marqueurs verts)
+    fig.add_trace(go.Scatter(
+        x=df_synthese.columns,
+        y=livraisons_y,
+        mode='markers',
+        name='Livraison reçue',
+        marker=dict(color='#00ff00', size=14, symbol='triangle-up', line=dict(color='white', width=1)),
+        hovertemplate='Livraison: %{y}<extra></extra>'
+    ))
+    
+    # Ligne du Seuil de sécurité
+    fig.add_trace(go.Scatter(
+        x=[df_synthese.columns[0], df_synthese.columns[-1]],
+        y=[stock_secu_qte, stock_secu_qte],
+        mode='lines',
+        name='Seuil de Sécurité',
+        line=dict(color='#ff4d4d', width=2, dash='dash')
+    ))
+    
+    fig.update_layout(
+        title=dict(text="Évolution du Stock dans le Temps", font=dict(size=20, color="white")),
+        xaxis_title="Mois",
+        yaxis_title="Quantité en Stock",
+        template="plotly_dark",
+        hovermode="x unified",
+        margin=dict(l=40, r=40, t=60, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)'
+    )
+    
+    return fig
+
+def show_history():
+    st.markdown("---")
+    st.subheader("⧉ Historique des simulations")
+
+    rows = load_simulations()
+
+    for row in rows:
+        if st.button(f"Simulation N°{row.id}"):
+            df_main, df_synth = json_to_df(row.df_main, row.df_synth)
+
+            st.write("### Tableau Principal")
+            st.dataframe(df_main)
+
+            st.write("### Tableau Synthèse")
+            st.dataframe(df_synth)
+
+# --- APPLICATION PRINCIPALE ---
+
+def main():
+    st.title("Gestion de Stock")
+    st.markdown("Cette application propose une version dynamique interactive et intelligente de calculs de détermination de consommation réguliére d'une entreprise.")
+    
+    # --- SIDEBAR ---
+    #st.sidebar.header("⚙️ Paramètres d'Entrée")
+    
+    conso_annuelle = st.sidebar.number_input("Consommation annuelle", value=None, min_value=0, step=100, placeholder="Ex: 1200")
+    conso_mensuelle = st.sidebar.number_input("Consommation mensuelle", value=None, min_value=0, step=10, placeholder="Ex: 100")
+    prix_unitaire = st.sidebar.number_input("Prix unitaire (Ariary)", value=None, min_value=0.0, step=1000.0, placeholder="Ex: 16000")
+    cout_passation = st.sidebar.number_input("Coût de passation", value=None, min_value=0.0, step=1000.0, placeholder="Ex: 60000")
+    taux_possession = st.sidebar.number_input("Taux de possession", value=None, min_value=0.01, step=0.01, format="%.2f", placeholder="Ex: 0.10")
+    delai_appro = st.sidebar.number_input("Délai d'appro. (mois)", value=None, min_value=0.0, step=0.1, placeholder="Ex: 1.5")
+    stock_secu_mois = st.sidebar.number_input("Stock de sécurité (mois)", value=None, min_value=0.0, step=0.1, placeholder="Ex: 0.5")
+    
+    st.sidebar.markdown("---")
+    #st.sidebar.header("⚙️ Paramètres de Simulation")
+    horizon = st.sidebar.number_input("Horizon de simulation (mois)", value=14, min_value=1, max_value=60)
+    
+    mois_noms_complets = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
+    mois_debut = st.sidebar.selectbox("Mois de début", mois_noms_complets, index=10) # 10 = Novembre
+    stock_initial = st.sidebar.number_input("Stock initial", value=0, step=10)
+    
+    # --- VÉRIFICATION DES ENTRÉES ---
+    params = [conso_annuelle, conso_mensuelle, prix_unitaire, cout_passation, taux_possession, delai_appro, stock_secu_mois]
+    if any(p is None for p in params):
+        st.info("⫷    **Action Requise :** Veuillez renseigner tous les paramètres d'entrée dans la barre latérale gauche pour lancer les calculs et afficher la simulation.")
+        show_history()
+        return
+        
+    if prix_unitaire <= 0 or taux_possession <= 0:
+        st.error("Le prix unitaire et le taux de possession doivent être strictement supérieurs à 0 pour le calcul de Wilson.")
+        show_history()
+        return
+        
+    # --- CALCULS ---
+    N, Q, periode, point_commande = calcul_stock(
+        conso_annuelle, conso_mensuelle, prix_unitaire, 
+        cout_passation, taux_possession, delai_appro, stock_secu_mois
+    )
+    stock_secu_qte = stock_secu_mois * conso_mensuelle
+    
+    # --- RESULTATS / KPIs ---
+    st.header("Indicateurs Clés de Performance (KPI)")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric(label="Nombre de commandes (N)", value=f"{N} / an")
+    with col2:
+        st.metric(label="Quantité économique (Q)", value=f"{Q} unités")
+    with col3:
+        st.metric(label="Période entre commandes", value=f"{periode} mois")
+    with col4:
+        st.metric(label="Point de commande", value=f"{point_commande} unités")
+
+    st.markdown("---")
+
+    st.subheader("Tableau de consommation")
+    st.info(" **Éditez directement la colonne 'Consommation'** dans le tableau ci-dessous pour que l'algorithme intelligent (basé sur le Point de Commande) s'adapte en temps réel !")
+    
+    # Génération de la liste dynamique des mois
+    idx_debut = mois_noms_complets.index(mois_debut)
+    liste_mois = [mois_noms_complets[(idx_debut + i) % 12] for i in range(horizon)]
+    
+    # Dataframe pour l'éditeur interactif
+    df_conso_init = pd.DataFrame({
+        "Période": liste_mois,
+        "Consommation": [conso_mensuelle] * horizon
+    })
+    
+    df_conso_edite = st.data_editor(
+        df_conso_init, 
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Période": st.column_config.TextColumn("Mois", disabled=True),
+            "Consommation": st.column_config.NumberColumn("Consommation Prévue", min_value=0, step=10, required=True)
+        }
+    )
+    
+    df_dyn_main, df_dyn_synth = generate_table_dynamique(Q, point_commande, delai_appro, stock_initial, df_conso_edite)
+
+    if st.button("✔ Sauvegarder cette simulation"):
+        save_simulation(
+            params={
+                "conso_annuelle": conso_annuelle,
+                "conso_mensuelle": conso_mensuelle,
+                "prix_unitaire": prix_unitaire,
+                "cout_passation": cout_passation,
+                "taux_possession": taux_possession,
+                "delai_appro": delai_appro,
+                "stock_secu_mois": stock_secu_mois
+            },
+            results={
+                "N": N,
+                "Q": Q,
+                "periode": periode,
+                "point_commande": point_commande
+            },
+            df_main=df_dyn_main,
+            df_synth=df_dyn_synth
+        )
+
+        st.success("✔ Simulation sauvegardée !")
+        import streamlit.components.v1 as components
+        components.html(
+            """
+            <script>
+            setTimeout(function() {
+                var alerts = window.parent.document.querySelectorAll('[data-testid="stAlert"]');
+                alerts.forEach(function(a) {
+                    if (a.innerText.includes('Simulation sauvegardée')) {
+                        a.style.display = 'none';
+                    }
+                });
+            }, 5000);
+            </script>
+            """,
+            height=0,
+            width=0,
+        )
+
+    st.subheader("Graphique d'évolution")
+    fig_dyn = generate_graph(df_dyn_synth, stock_secu_qte)
+    st.plotly_chart(fig_dyn, use_container_width=True)
+    
+    st.subheader("Tableau Principal")
+    st.dataframe(df_dyn_main, use_container_width=True, hide_index=True)
+    
+    st.subheader("Tableau de Synthèse")
+    st.dataframe(df_dyn_synth, use_container_width=True)
+
+    
+    # Export
+    buffer_dyn = BytesIO()
+    with pd.ExcelWriter(buffer_dyn, engine='openpyxl') as writer:
+        df_dyn_main.to_excel(writer, sheet_name='Principal_Dyn', index=False)
+        df_dyn_synth.to_excel(writer, sheet_name='Synthèse_Dyn')
+    
+    st.download_button(
+        label="Exporter vers Excel",
+        data=buffer_dyn.getvalue(),
+        file_name="gestion_stock_dynamique.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    
+    show_history()
+
+if __name__ == "__main__":
+    main()
